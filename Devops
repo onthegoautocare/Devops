@@ -1,0 +1,151 @@
+# 1. Build your tooling image (optional, for local development)
+docker build -t devops-iac:latest .
+
+# 2. Terraform apply
+cd terraform
+terraform init \
+  -backend-config="bucket=$TF_STATE_BUCKET" \
+  -backend-config="dynamodb_table=$TF_LOCK_TABLE"
+terraform apply -auto-approve \
+  -var="tf_state_bucket=$TF_STATE_BUCKET" \
+  -var="tf_state_lock_table=$TF_LOCK_TABLE"
+
+# 3. CDK deploy
+cd ../cdk
+npm install
+npm run build
+npx cdk deploy --require-approval never
+
+
+# S3 bucket + DynamoDB for remote state
+resource "aws_s3_bucket" "tf_state" {
+  bucket = var.tf_state_bucket
+  acl    = "private"
+  versioning { enabled = true }
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        sse_algorithm = "AES256"
+      }
+    }
+  }
+}
+
+resource "aws_dynamodb_table" "tf_lock" {
+  name         = var.tf_state_lock_table
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+}
+
+# CloudTrail for audit logs
+resource "aws_cloudtrail" "audit" {
+  name                          = "onthego-audit-trail"
+  s3_bucket_name                = aws_s3_bucket.tf_state.id
+  include_global_service_events = true
+  is_multi_region_trail         = true
+  enable_log_file_validation    = true
+}
+
+# AWS Config for resource recording
+data "aws_iam_policy_document" "config_assume" {
+  statement {
+    effect    = "Allow"
+    actions   = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["config.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "config_role" {
+  name               = "onthego-config-role"
+  assume_role_policy = data.aws_iam_policy_document.config_assume.json
+}
+
+resource "aws_s3_bucket" "config_bucket" {
+  bucket = "${var.tf_state_bucket}-config"
+  acl    = "private"
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        sse_algorithm = "AES256"
+      }
+    }
+  }
+}
+
+resource "aws_config_configuration_recorder" "recorder" {
+  name     = "onthego-recorder"
+  role_arn = aws_iam_role.config_role.arn
+}
+
+resource "aws_config_delivery_channel" "channel" {
+  name           = "onthego-channel"
+  s3_bucket_name = aws_s3_bucket.config_bucket.id
+  depends_on     = [aws_config_configuration_recorder.recorder]
+}
+
+resource "aws_config_configuration_recorder_status" "status" {
+  name       = aws_config_configuration_recorder.recorder.name
+  is_enabled = true
+}
+
+
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+
+export class InfraStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    // VPC & ECS Cluster
+    const vpc = new ec2.Vpc(this, 'VPC', { maxAzs: 2 });
+    const cluster = new ecs.Cluster(this, 'Cluster', { vpc });
+
+    // ECR Repository
+    const repo = new ecr.Repository(this, 'AppRepo', {
+      repositoryName: 'onthego-app'
+    });
+
+    // Fargate Service
+    const taskDef = new ecs.FargateTaskDefinition(this, 'TaskDef', {
+      cpu: 256,
+      memoryLimitMiB: 512
+    });
+    taskDef.addContainer('AppContainer', {
+      image: ecs.ContainerImage.fromEcrRepository(repo),
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'onthego' }),
+      portMappings: [{ containerPort: 80 }]
+    });
+    const svc = new ecs.FargateService(this, 'Service', {
+      cluster,
+      taskDefinition: taskDef,
+      desiredCount: 2
+    });
+
+    // Public Load Balancer
+    const lb = new elbv2.ApplicationLoadBalancer(this, 'LB', {
+      vpc,
+      internetFacing: true
+    });
+    const listener = lb.addListener('Listener', { port: 80 });
+    listener.addTargets('ECS', {
+      port: 80,
+      targets: [svc]
+    });
+
+    // Output the LB DNS
+    new cdk.CfnOutput(this, 'LoadBalancerDNS', {
+      value: lb.loadBalancerDnsName
+    });
+  }
+}
